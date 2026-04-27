@@ -1,6 +1,7 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+from app.services.revenue_summary import summarize_revenue_by_local_month
 
 async def calculate_monthly_revenue(property_id: str, month: int, year: int, db_session=None) -> Decimal:
     """
@@ -31,79 +32,123 @@ async def calculate_monthly_revenue(property_id: str, month: int, year: int, db_
     
     return Decimal('0') # Placeholder for now until DB connection is finalized
 
-async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str, Any]:
+
+def _build_mock_rows(property_id: str, tenant_id: str) -> List[Dict[str, Any]]:
+    paris = "Europe/Paris"
+    new_york = "America/New_York"
+
+    seeded_rows: Dict[tuple[str, str], List[tuple[datetime, Decimal, str]]] = {
+        ("tenant-a", "prop-001"): [
+            (datetime(2024, 2, 29, 23, 30, tzinfo=timezone.utc), Decimal("1250.000"), paris),
+            (datetime(2024, 3, 15, 10, 0, tzinfo=timezone.utc), Decimal("333.333"), paris),
+            (datetime(2024, 3, 16, 10, 0, tzinfo=timezone.utc), Decimal("333.333"), paris),
+            (datetime(2024, 3, 17, 10, 0, tzinfo=timezone.utc), Decimal("333.334"), paris),
+        ],
+        ("tenant-a", "prop-002"): [
+            (datetime(2024, 3, 5, 14, 0, tzinfo=timezone.utc), Decimal("1250.00"), paris),
+            (datetime(2024, 3, 12, 16, 0, tzinfo=timezone.utc), Decimal("1475.50"), paris),
+            (datetime(2024, 3, 20, 15, 0, tzinfo=timezone.utc), Decimal("1199.25"), paris),
+            (datetime(2024, 3, 25, 18, 0, tzinfo=timezone.utc), Decimal("1050.75"), paris),
+        ],
+        ("tenant-a", "prop-003"): [
+            (datetime(2024, 3, 2, 15, 0, tzinfo=timezone.utc), Decimal("2850.00"), paris),
+            (datetime(2024, 3, 18, 16, 0, tzinfo=timezone.utc), Decimal("3250.50"), paris),
+        ],
+        ("tenant-b", "prop-004"): [
+            (datetime(2024, 3, 8, 18, 0, tzinfo=timezone.utc), Decimal("420.00"), new_york),
+            (datetime(2024, 3, 14, 17, 0, tzinfo=timezone.utc), Decimal("560.75"), new_york),
+            (datetime(2024, 3, 22, 16, 0, tzinfo=timezone.utc), Decimal("480.25"), new_york),
+            (datetime(2024, 3, 28, 19, 0, tzinfo=timezone.utc), Decimal("315.50"), new_york),
+        ],
+        ("tenant-b", "prop-005"): [
+            (datetime(2024, 3, 6, 19, 0, tzinfo=timezone.utc), Decimal("920.00"), new_york),
+            (datetime(2024, 3, 15, 18, 0, tzinfo=timezone.utc), Decimal("1080.40"), new_york),
+            (datetime(2024, 3, 24, 20, 0, tzinfo=timezone.utc), Decimal("1255.60"), new_york),
+        ],
+    }
+
+    rows = seeded_rows.get((tenant_id, property_id), [])
+    return [
+        {
+            "check_in_date": check_in_date,
+            "total_amount": total_amount,
+            "timezone": timezone_name,
+        }
+        for check_in_date, total_amount, timezone_name in rows
+    ]
+
+
+async def calculate_revenue_summary(
+    property_id: str,
+    tenant_id: str,
+    month: Optional[int] = None,
+    year: Optional[int] = None,
+) -> Dict[str, Any]:
     """
-    Aggregates revenue from database.
+    Aggregates revenue from database and returns a property-local monthly summary.
+    If month/year are omitted, the latest available local month is used.
     """
     try:
-        # Import database pool
-        from app.core.database_pool import DatabasePool
-        
-        # Initialize pool if needed
-        db_pool = DatabasePool()
+        from app.core.database_pool import db_pool
+        from sqlalchemy import text
+
         await db_pool.initialize()
-        
+
         if db_pool.session_factory:
             async with db_pool.get_session() as session:
-                # Use SQLAlchemy text for raw SQL
-                from sqlalchemy import text
-                
-                query = text("""
-                    SELECT 
-                        property_id,
-                        SUM(total_amount) as total_revenue,
-                        COUNT(*) as reservation_count
-                    FROM reservations 
-                    WHERE property_id = :property_id AND tenant_id = :tenant_id
-                    GROUP BY property_id
-                """)
-                
-                result = await session.execute(query, {
-                    "property_id": property_id, 
-                    "tenant_id": tenant_id
-                })
-                row = result.fetchone()
-                
-                if row:
-                    total_revenue = Decimal(str(row.total_revenue))
-                    return {
+                query = text(
+                    """
+                    SELECT
+                        r.check_in_date,
+                        r.total_amount,
+                        p.timezone
+                    FROM reservations r
+                    JOIN properties p
+                        ON p.id = r.property_id
+                       AND p.tenant_id = r.tenant_id
+                    WHERE r.property_id = :property_id
+                      AND r.tenant_id = :tenant_id
+                    ORDER BY r.check_in_date
+                    """
+                )
+
+                result = await session.execute(
+                    query,
+                    {
                         "property_id": property_id,
                         "tenant_id": tenant_id,
-                        "total": str(total_revenue),
-                        "currency": "USD", 
-                        "count": row.reservation_count
-                    }
-                else:
-                    # No reservations found for this property
-                    return {
-                        "property_id": property_id,
-                        "tenant_id": tenant_id,
-                        "total": "0.00",
-                        "currency": "USD",
-                        "count": 0
-                    }
-        else:
-            raise Exception("Database pool not available")
-            
+                    },
+                )
+                rows = [dict(row) for row in result.mappings().all()]
+
+                summary = summarize_revenue_by_local_month(rows, month=month, year=year)
+                return {
+                    "property_id": property_id,
+                    "tenant_id": tenant_id,
+                    "total": str(summary.total),
+                    "currency": "USD",
+                    "count": summary.count,
+                    "year": summary.year,
+                    "month": summary.month,
+                }
+
+        raise Exception("Database pool not available")
+
     except Exception as e:
         print(f"Database error for {property_id} (tenant: {tenant_id}): {e}")
-        
-        # Create property-specific mock data for testing when DB is unavailable
-        # This ensures each property shows different figures
-        mock_data = {
-            'prop-001': {'total': '1000.00', 'count': 3},
-            'prop-002': {'total': '4975.50', 'count': 4}, 
-            'prop-003': {'total': '6100.50', 'count': 2},
-            'prop-004': {'total': '1776.50', 'count': 4},
-            'prop-005': {'total': '3256.00', 'count': 3}
-        }
-        
-        mock_property_data = mock_data.get(property_id, {'total': '0.00', 'count': 0})
-        
+
+        mock_rows = _build_mock_rows(property_id, tenant_id)
+        summary = summarize_revenue_by_local_month(mock_rows, month=month, year=year)
+
         return {
             "property_id": property_id,
-            "tenant_id": tenant_id, 
-            "total": mock_property_data['total'],
+            "tenant_id": tenant_id,
+            "total": str(summary.total),
             "currency": "USD",
-            "count": mock_property_data['count']
+            "count": summary.count,
+            "year": summary.year,
+            "month": summary.month,
         }
+
+async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str, Any]:
+    return await calculate_revenue_summary(property_id=property_id, tenant_id=tenant_id)
